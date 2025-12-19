@@ -1,180 +1,105 @@
 import cv2
 import torch
-import sys
-import os
 import numpy as np
 import socket
 import struct
-import time
 import open3d as o3d
+import os
+import sys
 
-# --- CONFIGURATION ---
-VIDEO_PATH = "tum1.mp4"
-HOST = '127.0.0.1'
-PORT = 8080
-
-# Tighter depth range for cleaner desk maps
-DEPTH_SCALE = 3000.0        # 3 meters max range
-DEPTH_TRUNC = 2.5           # Hard cut-off at 2.5m
-
-LOOP_VIDEO = False           
-
-# 1. Setup AI Model
-REPO_SRC_PATH = os.path.join(os.getcwd(), 'src/Depth-Anything-3/src')
+# --- FIX IMPORT PATH ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_SRC_PATH = os.path.join(BASE_DIR, 'src', 'Depth-Anything-3', 'src')
 sys.path.append(REPO_SRC_PATH)
-try:
-    from depth_anything_3.api import DepthAnything3
-except ImportError:
-    print("Error importing DepthAnything3")
-    sys.exit(1)
+from depth_anything_3.api import DepthAnything3
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Loading Model on {DEVICE}...")
-model = DepthAnything3.from_pretrained("depth-anything/DA3-SMALL").to(DEVICE).eval()
+# --- CONFIG ---
+ 
+VIDEO_PATH = "tum1.mp4"
+INTRINSIC_OBJ = o3d.camera.PinholeCameraIntrinsic(640, 480, 517.3, 516.5, 318.6, 255.3)
+intrinsic_matrix = INTRINSIC_OBJ.intrinsic_matrix
 
-# 2. Setup The Invisible Map
-print("Initializing Dense Volume...")
+# --- TSDF VOLUME (The "Solid Surface" Engine) ---
+# sdf_trunc: defines how much 'smoothing' happens near the surface. 
+# 0.04 (4cm) is good for detail.
 volume = o3d.pipelines.integration.ScalableTSDFVolume(
-    voxel_length=0.015,     # 1.5cm voxels (High Detail)
-    sdf_trunc=0.05,         # Thickness of surface
+    voxel_length=0.04,
+    sdf_trunc=0.08,
     color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
 )
 
-intrinsic = o3d.camera.PinholeCameraIntrinsic(640, 480, 517.3, 516.5, 318.6, 255.3)
-
-# 3. Connect to SLAM
+# 1. Model & Socket
+model = DepthAnything3.from_pretrained("depth-anything/DA3-SMALL").to('cuda').eval()
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-try:
-    sock.connect((HOST, PORT))
-    print(f"Connected to SLAM Server at {HOST}:{PORT}")
-except:
-    print("Failed to connect. Is ./socket_slam running?")
-    sys.exit(1)
+sock.connect(('127.0.0.1', 8080))
 
-# 4. Setup Video
 cap = cv2.VideoCapture(VIDEO_PATH)
-if not cap.isOpened():
-    print(f"Error: Could not open video {VIDEO_PATH}")
-    sys.exit(1)
-
-# Get video FPS to calculate correct timestamps
-fps = cap.get(cv2.CAP_PROP_FPS)
-if fps < 1: fps = 30.0
-
-start_time = time.time()
 frame_id = 0
 
-print("=== RUNNING V2 (Edge Filtered)! Press 'q' to stop ===")
+print("=== STARTING TSDF SOLID SURFACE RECONSTRUCTION ===")
 
 try:
     while True:
-        ret, raw_frame = cap.read()
-        
-        if not ret:
-            if LOOP_VIDEO:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            else:
-                break
-        
-        # Resize to match SLAM Calibration
-        frame = cv2.resize(raw_frame, (640, 480))
+        ret, frame = cap.read()
+        if not ret: break
         h, w = frame.shape[:2]
 
-        # --- AI DEPTH ---
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # A. AI Prediction
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         with torch.no_grad():
-            prediction = model.inference([rgb_frame], export_dir=None, export_format="npz")
-        
-        depth = prediction.depth[0]
-        
-        if depth.shape[:2] != (h, w):
-            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-        
-        # --- CLEANUP STEP 1: Percentile Clipping (Remove Spikes) ---
-        d_min = np.percentile(depth, 2)
-        d_max = np.percentile(depth, 98)
-        depth = np.clip(depth, d_min, d_max)
-        depth_normalized = (depth - d_min) / (d_max - d_min + 1e-6)
+            pred = model.inference([rgb], export_dir=None, export_format="npz")
+        skin_relative = 1.0 / (cv2.resize(pred.depth[0], (w, h)) + 1e-6)
 
-        # --- CLEANUP STEP 2: Edge Eraser (Flying Pixel Removal) ---
-        # Calculate gradients (where depth changes fast)
-        grad_x = cv2.Sobel(depth_normalized, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(depth_normalized, cv2.CV_64F, 0, 1, ksize=3)
-        magnitude = cv2.magnitude(grad_x, grad_y)
-        
-        # Mask out edges that are too sharp (threshold 0.5 usually works well)
-        edge_mask = magnitude > 0.5
-        depth_normalized[edge_mask] = 0
-        
-        # --- CLEANUP STEP 3: Bilateral Filter (Smooth Surfaces) ---
-        # Convert to float32 for filtering
-        d_float = depth_normalized.astype(np.float32)
-        d_filtered = cv2.bilateralFilter(d_float, 5, 0.1, 0.1)
-        
-        depth_mm = (d_filtered * DEPTH_SCALE).astype(np.uint16)
+        # B. SLAM Sync
+        header = struct.pack('=iid', w, h, frame_id / 20.0)
+        sock.sendall(header + frame.tobytes() + (skin_relative.astype(np.float32)).tobytes()[:(w*h*2)]) # Dummy depth
 
-        # --- SEND TO C++ ---
-        # FIX: Use calculated timestamp, NOT system clock
-        sim_timestamp = frame_id / fps
-        header = struct.pack('=iid', w, h, sim_timestamp)
+        # C. Receive Pose & Skeleton
+        status = struct.unpack('i', sock.recv(4))[0]
+        pose = np.frombuffer(sock.recv(64), dtype=np.float32).reshape(4,4, order='F')
+        n_pts = struct.unpack('i', sock.recv(4))[0]
         
-        try:
-            sock.sendall(header)
-            sock.sendall(frame.tobytes())
-            sock.sendall(depth_mm.tobytes())
-
-            status_data = sock.recv(4)
-            if not status_data: break
-            status = struct.unpack('i', status_data)[0]
-
-            pose_data = sock.recv(64)
-            if not pose_data: break
-        except BrokenPipeError:
-            print("Server disconnected.")
-            break
-        
-        if status == 1:
-            pose_flat = struct.unpack('16f', pose_data)
-            T_cw = np.array(pose_flat).reshape(4, 4)
+        if n_pts > 0:
+            skeleton = np.frombuffer(sock.recv(n_pts * 12), dtype=np.float32).reshape(-1, 3)
             
-            try:
-                T_wc = np.linalg.inv(T_cw)
-            except:
-                continue
+            if status == 1:
+                # D. Scale Fusion
+                ai_v, slam_v = [], []
+                for u, v, z_slam in skeleton:
+                    ui, vi = int(u), int(v)
+                    if 0 <= ui < w and 0 <= vi < h:
+                        ai_v.append(skin_relative[vi, ui])
+                        slam_v.append(z_slam)
+                
+                if len(ai_v) > 10:
+                    scale = np.median(np.array(slam_v) / np.array(ai_v))
+                    real_depth = skin_relative * scale
+                    
+                    # E. INTEGRATE INTO VOLUME (Solid Surface logic)
+                    color_o3d = o3d.geometry.Image(rgb)
+                    depth_o3d = o3d.geometry.Image((real_depth * 1000).astype(np.uint16))
+                    
+                    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                        color_o3d, depth_o3d, depth_scale=1000.0, 
+                        depth_trunc=12.0, convert_rgb_to_intensity=False
+                    )
+                    
+                    # This "melts" the frame into the existing 3D structure
+                    volume.integrate(rgbd, INTRINSIC_OBJ, np.linalg.inv(pose))
 
-            o3d_color = o3d.geometry.Image(rgb_frame)
-            o3d_depth = o3d.geometry.Image(depth_mm)
-            
-            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                o3d_color, o3d_depth, 
-                depth_scale=1000.0, 
-                depth_trunc=DEPTH_TRUNC, 
-                convert_rgb_to_intensity=False
-            )
-
-            volume.integrate(rgbd, intrinsic, T_wc)
-
-        # Preview
-        cv2.imshow('Clean Mapper V2', frame)
-        cv2.imshow('Depth Filtered', (d_filtered * 255).astype(np.uint8)) # See what the map sees
-        
+        print(f"Frame {frame_id} | Scale: {scale if 'scale' in locals() else 0:.2f}", end='\r')
         frame_id += 1
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        cv2.imshow('Warehouse Feed', frame)
+        if cv2.waitKey(1) == ord('q'): break
 
 except KeyboardInterrupt:
-    print("Stopping...")
+    pass
 
-print("Extracting final mesh...")
+# F. EXTRACT FINAL MESH
+print("\nExtracting Mesh (Marching Cubes)...")
 mesh = volume.extract_triangle_mesh()
 mesh.compute_vertex_normals()
-o3d.io.write_triangle_mesh("final_map_v2.ply", mesh)
-print("Saved to final_map_v2.ply")
 
-sock.close()
-cap.release()
-cv2.destroyAllWindows()
-
-# Auto-open viewer
-o3d.visualization.draw_geometries([mesh], window_name="Result", width=960, height=540)
+o3d.io.write_triangle_mesh("solid_warehouse_mesh.ply", mesh)
+print("Saved solid_warehouse_mesh.ply")
+o3d.visualization.draw_geometries([mesh])

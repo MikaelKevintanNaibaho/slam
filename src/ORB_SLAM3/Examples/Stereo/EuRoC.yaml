@@ -80,6 +80,18 @@ ORBextractor.iniThFAST: 20
 ORBextractor.minThFAST: 7
 
 #--------------------------------------------------------------------------------------------
+# RGB-D Specific Parameters (Added for "Fake" RGB-D)
+#--------------------------------------------------------------------------------------------
+
+# Depth Map Factor: How many units = 1 meter? 
+# Your Python script sends mm (uint16), so 1000.0 is correct.
+RGBD.DepthMapFactor: 1000.0
+
+# Far Threshold: Pixels further than this (meters) are used for rotation only, not translation.
+# Since we are in a big warehouse, set this high (e.g., 20.0 or 40.0).
+RGBD.ThDepth: 70.0
+
+#--------------------------------------------------------------------------------------------
 # Viewer Parameters
 #--------------------------------------------------------------------------------------------
 Viewer.KeyFrameSize: 0.05
@@ -94,3 +106,8 @@ Viewer.ViewpointZ: -1.8
 Viewer.ViewpointF: 500.0
 Viewer.imageViewScale: 1.0
 
+# Baseline (meters)
+Stereo.b: 0.11
+
+# Baseline * fx (458.654 * 0.11)
+Stereo.bf: 50.5
